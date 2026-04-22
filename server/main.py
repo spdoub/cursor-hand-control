@@ -130,6 +130,10 @@ async def poll_windows() -> None:
                 if state.selected_title not in titles:
                     state.selected_title = windows[0].title if windows else None
                 prev_key = key
+                print(
+                    f"[windows] updated ({len(windows)}): "
+                    + ", ".join(f"{i}={w.project}" for i, w in enumerate(windows))
+                )
                 await broadcast(state.to_payload())
         await asyncio.sleep(POLL_INTERVAL_S)
 
@@ -194,6 +198,10 @@ async def handle_switch(delta: int) -> None:
         new_idx = (current + delta) % len(state.windows)
         win = state.windows[new_idx]
         state.selected_title = win.title
+        print(
+            f"[switch] delta={delta:+d} {current} -> {new_idx} "
+            f"({win.project})"
+        )
         await broadcast(state.to_payload())
     focus_window(win.title)
 
