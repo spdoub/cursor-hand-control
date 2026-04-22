@@ -56,6 +56,7 @@ class State:
         self.clients: set[WebSocket] = set()
         self.watcher = KeystrokeWatcher()
         self.lock = asyncio.Lock()
+        self.hold_start_ts: Optional[float] = None
 
     def _selected_index(self) -> int:
         if not self.windows:
@@ -126,6 +127,7 @@ async def poll_windows() -> None:
 
 
 async def handle_hold_start() -> None:
+    state.hold_start_ts = time.monotonic()
     win = state.selected_window()
     if win is not None:
         focus_window(win.title)
@@ -137,11 +139,16 @@ async def handle_hold_start() -> None:
 async def handle_hold_end() -> None:
     right_option_up()
     release_ts = time.monotonic()
+    hold_duration = (
+        release_ts - state.hold_start_ts if state.hold_start_ts else 0.0
+    )
     # Run the potentially-blocking settle wait in a thread.
     await asyncio.to_thread(
         state.watcher.wait_for_typing_to_settle,
         release_ts,
+        hold_duration,
         ENTER_IDLE_MS,
+        2.5,
         ENTER_MAX_WAIT_S,
     )
     press_enter()
@@ -246,14 +253,33 @@ def get_lan_ip() -> str:
         return "127.0.0.1"
 
 
+def _check_accessibility() -> bool:
+    try:
+        from ApplicationServices import AXIsProcessTrusted  # type: ignore
+        return bool(AXIsProcessTrusted())
+    except Exception:
+        return False
+
+
 def main() -> None:
     import uvicorn
 
     ip = get_lan_ip()
-    print("\n" + "=" * 52)
-    print("Hand Control running.")
+    trusted = _check_accessibility()
+
+    print("\n" + "=" * 60)
+    print("  Hand Control running.")
     print(f"  On your phone, open:  http://{ip}:8000")
-    print("=" * 52 + "\n")
+    print("=" * 60)
+    if trusted:
+        print("  Accessibility: OK (precise Enter timing enabled)")
+    else:
+        print("  Accessibility: NOT GRANTED")
+        print("  → Open System Settings → Privacy & Security → Accessibility")
+        print("    and enable your terminal app (Terminal, iTerm, ...).")
+        print("    Then restart this server.")
+        print("  Using hold-duration heuristic for Enter timing until then.")
+    print("=" * 60 + "\n")
     uvicorn.run("server.main:app", host="0.0.0.0", port=8000, log_level="info")
 
 

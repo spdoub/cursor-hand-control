@@ -39,6 +39,7 @@ class KeystrokeWatcher:
         self._thread: Optional[threading.Thread] = None
         self._tap = None
         self._started = False
+        self.active: bool = False  # True once CGEventTap is running
 
     @property
     def last_keydown_ts(self) -> float:
@@ -64,13 +65,16 @@ class KeystrokeWatcher:
             # Most likely: Accessibility permission not granted.
             print(
                 "[keystroke_watcher] Failed to create event tap. "
-                "Grant Accessibility permission to your terminal / Python "
-                "binary in System Settings → Privacy & Security → Accessibility."
+                "Enter-timing will use a heuristic fallback based on hold "
+                "duration. Grant Accessibility permission to your terminal "
+                "in System Settings → Privacy & Security → Accessibility, "
+                "then restart the server for precise Enter timing."
             )
             return
         source = CFMachPortCreateRunLoopSource(None, self._tap, 0)
         CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopCommonModes)
         CGEventTapEnable(self._tap, True)
+        self.active = True
         CFRunLoopRun()
 
     def start(self) -> None:
@@ -83,28 +87,58 @@ class KeystrokeWatcher:
     def wait_for_typing_to_settle(
         self,
         release_ts: float,
+        hold_duration_s: float,
         idle_ms: int = 400,
-        max_wait_s: float = 8.0,
+        first_key_timeout_s: float = 2.5,
+        max_wait_s: float = 10.0,
         poll_ms: int = 50,
     ) -> None:
-        """Block until keystrokes have been quiet for `idle_ms` past
-        `release_ts`, or `max_wait_s` elapses.
+        """Block until Wispr Flow has finished typing, then return.
 
-        `release_ts` is the time.monotonic() value taken right after we
-        released Right Option. Any keystroke after that is assumed to be
-        Wispr Flow typing out the transcription.
+        Two-phase behavior when the event tap is active:
+            1. Wait up to `first_key_timeout_s` for the first keystroke
+               after release (Wispr starting to type).
+            2. Once it starts, wait until keystrokes go quiet for `idle_ms`.
+
+        If the event tap isn't active (Accessibility not granted) or no
+        keystroke ever arrives, fall back to a heuristic delay based on
+        how long the hold lasted. This keeps things usable without
+        Accessibility permission, at the cost of precision.
         """
-        deadline = release_ts + max_wait_s
-        idle_s = idle_ms / 1000.0
         poll_s = poll_ms / 1000.0
+        idle_s = idle_ms / 1000.0
 
+        def _heuristic_fallback() -> None:
+            # Wispr's transcription latency scales roughly with audio length.
+            # Empirically: ~0.4s overhead + ~30% of hold duration, capped.
+            extra = 0.4 + min(hold_duration_s * 0.3, 3.0)
+            time.sleep(extra)
+
+        if not self.active:
+            _heuristic_fallback()
+            return
+
+        # Phase 1: wait for Wispr's first keystroke.
+        # Allow more time for long dictations (server-side transcription
+        # can take a while to start).
+        first_deadline = release_ts + max(first_key_timeout_s, hold_duration_s * 0.6)
         while True:
             now = time.monotonic()
-            if now > deadline:
+            if self.last_keydown_ts > release_ts:
+                break
+            if now > first_deadline:
+                # No typing detected — either Wispr failed, or the tap
+                # isn't actually seeing keystrokes. Use heuristic.
+                _heuristic_fallback()
                 return
-            last = self.last_keydown_ts
-            # Only count keydowns that happened after we released.
-            effective_last = max(last, release_ts)
-            if now - effective_last >= idle_s:
+            time.sleep(poll_s)
+
+        # Phase 2: wait for typing to go quiet.
+        hard_deadline = release_ts + max_wait_s
+        while True:
+            now = time.monotonic()
+            if now > hard_deadline:
+                return
+            if now - self.last_keydown_ts >= idle_s:
                 return
             time.sleep(poll_s)
