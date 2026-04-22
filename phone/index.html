@@ -341,11 +341,14 @@
   .preview.warn .label { color: var(--red); opacity: 0.85; }
   .preview.sent  .label { color: var(--green); opacity: 0.85; }
 
-  /* In ready mode, shrink the project name / hint so the preview
-     gets the room. */
-  .hold.ready .blob,
-  .hold.ready .hint { display: none; }
+  /* In ready mode, shrink the project name / blob so the preview
+     card has room. Hint stays visible when there's no preview card
+     (falls back to "Ready — Submit or Delete"). */
+  .hold.ready .blob { display: none; }
   .hold.ready .project { font-size: 12px; opacity: 0.5; }
+  /* When the preview card is present, hide the hint so the card
+     gets visual priority. */
+  .hold.has-preview .hint { display: none; }
 
   .pulse {
     position: absolute;
@@ -637,7 +640,12 @@
     } else if (m === 'idle')      hintEl.textContent = 'Hold to talk';
     else if (m === 'holding')     hintEl.textContent = 'Listening…';
     else if (m === 'waiting')     hintEl.textContent = 'Transcribing…';
-    else if (m === 'ready')       hintEl.textContent = '';
+    else if (m === 'ready') {
+      // Show a small hint when there's no preview card to fill the space.
+      hintEl.textContent = (lastTranscription || !lastHadTextField)
+        ? ''
+        : 'Ready — Submit or Delete';
+    }
     else if (m === 'sent')        hintEl.textContent = '';
 
     // Only show the "no text field" warning while the user is actively
@@ -651,19 +659,21 @@
       if (lastTranscription) {
         previewLabelEl.textContent = 'Transcription';
         previewTextEl.textContent = lastTranscription;
+        previewEl.classList.add('show');
       } else if (!lastHadTextField) {
-        previewEl.classList.add('warn');
+        // Confident failure: macOS reported no focused text field.
+        // This one is actionable — warn in red.
+        previewEl.classList.add('warn', 'show');
         previewLabelEl.textContent = 'No text field focused';
         previewTextEl.textContent =
           "Click into the Cursor chat box (or any text field) before holding.";
-      } else {
-        previewEl.classList.add('warn');
-        previewLabelEl.textContent = 'No text detected';
-        previewTextEl.textContent =
-          "Wispr didn't type anything into the focused field. "
-          + "Check that Wispr Flow is running and its hotkey is Right Option.";
       }
-      previewEl.classList.add('show');
+      // Otherwise: the field was focused and Wispr likely typed into it,
+      // but we couldn't read the content back (common with Electron /
+      // Cursor chat inputs that don't expose their value over the
+      // Accessibility API). Don't show a scary warning — the user can
+      // glance at their Mac to see what was dictated, and Submit /
+      // Delete still work as usual.
     } else if (m === 'sent') {
       // Wispr's "press enter" command already submitted the message.
       previewEl.classList.add('show', 'sent');
@@ -675,6 +685,11 @@
         if (mode === 'sent') setMode('idle');
       }, 3500);
     }
+
+    // Let the hold area know whether the preview card is present, so
+    // the hint text (our fallback when there's no preview) can be
+    // hidden to avoid competing with the card.
+    holdEl.classList.toggle('has-preview', previewEl.classList.contains('show'));
 
     // Buttons — only active in 'ready' mode. In 'sent', nothing to do.
     const btnsActive = (m === 'ready');

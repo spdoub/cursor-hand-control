@@ -225,45 +225,72 @@ async def handle_hold_start() -> None:
     right_option_down()
 
 
+_DEBUG_CAPTURE = os.environ.get("HC_DEBUG_CAPTURE", "").strip() not in ("", "0", "false", "False")
+
+
 def _wait_and_capture(release_ts: float, hold_duration: float) -> tuple[str, bool]:
     """Wait for Wispr's typing to settle while polling the focused
-    text field at ~20 Hz.
+    text field at ~66 Hz.
 
-    Returns (final_text, auto_submitted).
+    Returns (longest_text_seen, auto_submitted).
 
     Polling matters because of Wispr's built-in *"press enter"* voice
     command: Wispr will type your message and then press Return, which
-    immediately clears the chat input in most apps. If we only read AX
-    *after* the settle, we'd see an empty field. By remembering the
-    latest non-empty value we saw during typing, we can still show the
-    user what they actually dictated even though Wispr already
-    submitted it.
+    immediately clears the chat input in most apps. By remembering the
+    **longest** snapshot we ever saw — not just the latest — we can
+    still show the user what was dictated even if the field got
+    cleared a few milliseconds later. This also helps with Electron /
+    Cursor chat inputs where AXValue sometimes returns a short
+    mid-typing snapshot and then briefly returns empty before showing
+    the final value.
+
+    Set ``HC_DEBUG_CAPTURE=1`` for a per-poll log line so you can see
+    exactly what AX reported and when.
     """
-    poll_s = 0.05
+    # 15 ms keeps us ahead of typical dictation-tool typing bursts
+    # (which land several chars per 50 ms) without burning measurable
+    # CPU. Worker thread only runs during hold_end, so even 60+ reads
+    # per second are cheap.
+    poll_s = 0.015
     idle_s = ENTER_IDLE_MS / 1000.0
     first_deadline = release_ts + max(2.5, hold_duration * 0.6)
     hard_deadline = release_ts + ENTER_MAX_WAIT_S
 
-    latest_text: str = ""
+    longest_text: str = ""
+    poll_count = 0
 
     def snapshot() -> None:
-        nonlocal latest_text
+        nonlocal longest_text, poll_count
         snap = read_focus()
-        if snap.text:
-            latest_text = snap.text
+        poll_count += 1
+        if _DEBUG_CAPTURE:
+            preview = (snap.text or "")[:60]
+            print(
+                f"[capture] poll #{poll_count:<3} "
+                f"has_field={snap.has_text_field} "
+                f"len={len(snap.text) if snap.text else 0:<3} "
+                f"text={preview!r}",
+                flush=True,
+            )
+        # Keep the longest snapshot we've ever seen so a mid-typing
+        # read survives the field being cleared by Wispr's Enter.
+        if snap.text and len(snap.text) > len(longest_text):
+            longest_text = snap.text
 
     watcher = state.watcher
 
-    # Phase 1: wait for first keystroke (or first non-empty AX read).
+    # Phase 1: wait for typing to start — either a keystroke or a
+    # growing AX value.
     while time.monotonic() < first_deadline:
         if watcher.active and watcher.last_keydown_ts > release_ts:
             break
         snapshot()
-        if latest_text:
+        if longest_text:
             break
         time.sleep(poll_s)
 
-    # Phase 2: wait for typing to settle, snapshotting as we go.
+    # Phase 2: keep snapshotting until typing has been quiet for
+    # ``idle_s`` or we hit the hard deadline.
     while True:
         now = time.monotonic()
         snapshot()
@@ -273,19 +300,22 @@ def _wait_and_capture(release_ts: float, hold_duration: float) -> tuple[str, boo
             if now - watcher.last_keydown_ts >= idle_s:
                 break
         else:
-            # No event tap — fall back to a heuristic quiet window.
             extra = 0.4 + min(hold_duration * 0.3, 3.0)
             if now - release_ts >= extra:
                 break
         time.sleep(poll_s)
 
-    # One last snapshot after settle, in case Wispr wrote more in the
-    # final poll window. If the field is now empty (auto-submit cleared
-    # it), latest_text still holds the pre-clear value.
+    # Final snapshot after settle — catches any late arrivals.
     snapshot()
 
     auto_submitted = watcher.saw_return_since(release_ts)
-    return latest_text, auto_submitted
+    if _DEBUG_CAPTURE:
+        print(
+            f"[capture] done polls={poll_count} longest_len={len(longest_text)} "
+            f"auto_submit={auto_submitted}",
+            flush=True,
+        )
+    return longest_text, auto_submitted
 
 
 async def handle_hold_end() -> None:
