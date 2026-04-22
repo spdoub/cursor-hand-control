@@ -1,0 +1,395 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta
+  name="viewport"
+  content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"
+/>
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="theme-color" content="#000000" />
+<title>Hand Control</title>
+<style>
+  :root {
+    --bg: #000;
+    --fg: #fff;
+    --muted: #666;
+    --accent: #ff4d1f;
+    --accent-soft: rgba(255, 77, 31, 0.18);
+    --edge-bg: #0a0a0a;
+    --edge-press: #1a1a1a;
+    --box: #121212;
+    --box-selected: #1d1d1d;
+    --box-border: #1d1d1d;
+    --box-border-selected: var(--accent);
+  }
+
+  * {
+    box-sizing: border-box;
+    -webkit-tap-highlight-color: transparent;
+    -webkit-touch-callout: none;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    width: 100%;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", Inter, system-ui, sans-serif;
+    overflow: hidden;
+    overscroll-behavior: none;
+    touch-action: none;
+  }
+
+  body {
+    display: flex;
+    flex-direction: column;
+    height: 100dvh;
+  }
+
+  /* Top bar: connection + window boxes */
+  header {
+    flex: 0 0 auto;
+    padding: 10px 14px 8px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    border-bottom: 1px solid #0e0e0e;
+  }
+
+  .status {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+
+  .dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #444;
+    transition: background 0.2s;
+  }
+  .dot.ok { background: #1ec67a; }
+  .dot.bad { background: #c23a1e; }
+
+  .boxes {
+    flex: 1;
+    display: flex;
+    gap: 6px;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .boxes::-webkit-scrollbar { display: none; }
+
+  .box {
+    flex: 0 0 auto;
+    min-width: 90px;
+    max-width: 180px;
+    padding: 8px 12px;
+    border: 1px solid var(--box-border);
+    background: var(--box);
+    border-radius: 10px;
+    font-size: 12px;
+    color: #aaa;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    transition: border-color 0.15s, background 0.15s, color 0.15s;
+  }
+  .box.selected {
+    border-color: var(--box-border-selected);
+    background: var(--box-selected);
+    color: var(--fg);
+  }
+
+  .empty-note {
+    flex: 1;
+    color: var(--muted);
+    font-size: 12px;
+    font-style: italic;
+  }
+
+  /* Main row: edge zones + hold area */
+  main {
+    flex: 1;
+    display: flex;
+    min-height: 0;
+  }
+
+  .edge {
+    flex: 0 0 14%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--edge-bg);
+    color: #555;
+    font-size: 40px;
+    transition: background 0.08s, color 0.08s;
+  }
+  .edge.active {
+    background: var(--edge-press);
+    color: var(--fg);
+  }
+
+  .hold {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+    background: var(--bg);
+    position: relative;
+    overflow: hidden;
+  }
+
+  .hold .project {
+    font-size: 28px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    max-width: 85%;
+    text-align: center;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .hold .hint {
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    color: var(--muted);
+  }
+
+  .hold.no-window .project { color: var(--muted); }
+  .hold.no-window .hint { opacity: 0; }
+
+  /* Pulse ring while holding */
+  .pulse {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 80px;
+    height: 80px;
+    border-radius: 50%;
+    background: var(--accent-soft);
+    transform: translate(-50%, -50%) scale(0);
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  .hold.holding .pulse {
+    animation: pulse 1.4s ease-out infinite;
+  }
+  .hold.holding .project { color: var(--accent); }
+  .hold.holding .hint { color: var(--accent); }
+
+  @keyframes pulse {
+    0%   { transform: translate(-50%, -50%) scale(0.4); opacity: 0.8; }
+    80%  { transform: translate(-50%, -50%) scale(5);   opacity: 0; }
+    100% { transform: translate(-50%, -50%) scale(5);   opacity: 0; }
+  }
+
+  /* The "mic" blob in the center */
+  .blob {
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: var(--muted);
+    transition: background 0.12s, transform 0.12s;
+  }
+  .hold.holding .blob {
+    background: var(--accent);
+    transform: scale(1.8);
+  }
+</style>
+</head>
+<body>
+  <header>
+    <div class="status">
+      <span class="dot" id="dot"></span>
+      <span id="statusText">connecting</span>
+    </div>
+    <div class="boxes" id="boxes">
+      <div class="empty-note">No Cursor windows detected</div>
+    </div>
+  </header>
+
+  <main>
+    <div class="edge" id="edgeLeft">◀</div>
+    <div class="hold" id="hold">
+      <div class="project" id="project">—</div>
+      <div class="blob"></div>
+      <div class="hint">Hold to talk</div>
+      <div class="pulse"></div>
+    </div>
+    <div class="edge" id="edgeRight">▶</div>
+  </main>
+
+<script>
+(() => {
+  const boxesEl = document.getElementById('boxes');
+  const projectEl = document.getElementById('project');
+  const holdEl = document.getElementById('hold');
+  const edgeL = document.getElementById('edgeLeft');
+  const edgeR = document.getElementById('edgeRight');
+  const dot = document.getElementById('dot');
+  const statusText = document.getElementById('statusText');
+
+  let ws = null;
+  let reconnectDelay = 500;
+  let windows = [];
+  let selected = -1;
+  let holding = false;
+  let wakeLock = null;
+
+  // ----- Wake lock: keep screen on while the app is open -----
+  async function requestWakeLock() {
+    if (!('wakeLock' in navigator)) return;
+    try {
+      wakeLock = await navigator.wakeLock.request('screen');
+      wakeLock.addEventListener('release', () => { wakeLock = null; });
+    } catch {}
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') requestWakeLock();
+  });
+  requestWakeLock();
+
+  // ----- WebSocket -----
+  function connect() {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    ws = new WebSocket(`${proto}://${location.host}/ws`);
+    ws.onopen = () => {
+      reconnectDelay = 500;
+      dot.className = 'dot ok';
+      statusText.textContent = 'connected';
+    };
+    ws.onclose = () => {
+      dot.className = 'dot bad';
+      statusText.textContent = 'reconnecting';
+      safeEndHold();
+      setTimeout(connect, reconnectDelay);
+      reconnectDelay = Math.min(reconnectDelay * 1.5, 5000);
+    };
+    ws.onerror = () => {};
+    ws.onmessage = (ev) => {
+      try {
+        const msg = JSON.parse(ev.data);
+        if (msg.type === 'state') {
+          windows = msg.windows || [];
+          selected = msg.selected;
+          render();
+        }
+      } catch {}
+    };
+  }
+
+  function send(obj) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(obj));
+    }
+  }
+
+  // ----- Rendering -----
+  function render() {
+    // Project name in center
+    if (windows.length === 0 || selected < 0) {
+      projectEl.textContent = 'No Cursor windows';
+      holdEl.classList.add('no-window');
+    } else {
+      projectEl.textContent = windows[selected].project || windows[selected].title;
+      holdEl.classList.remove('no-window');
+    }
+
+    // Top box strip
+    boxesEl.innerHTML = '';
+    if (windows.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'empty-note';
+      empty.textContent = 'No Cursor windows detected';
+      boxesEl.appendChild(empty);
+      return;
+    }
+    windows.forEach((w, i) => {
+      const el = document.createElement('div');
+      el.className = 'box' + (i === selected ? ' selected' : '');
+      el.textContent = w.project || w.title;
+      el.addEventListener('pointerdown', (e) => {
+        e.preventDefault();
+        send({ type: 'select', index: i });
+      });
+      boxesEl.appendChild(el);
+    });
+  }
+
+  // ----- Hold-to-talk -----
+  function startHold() {
+    if (holding) return;
+    if (windows.length === 0) return;
+    holding = true;
+    holdEl.classList.add('holding');
+    send({ type: 'hold_start' });
+  }
+
+  function endHold() {
+    if (!holding) return;
+    holding = false;
+    holdEl.classList.remove('holding');
+    send({ type: 'hold_end' });
+  }
+
+  function safeEndHold() {
+    if (holding) {
+      holding = false;
+      holdEl.classList.remove('holding');
+    }
+  }
+
+  // Pointer events on center hold area
+  holdEl.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    holdEl.setPointerCapture(e.pointerId);
+    startHold();
+  });
+  ['pointerup', 'pointercancel', 'pointerleave'].forEach((evt) => {
+    holdEl.addEventListener(evt, (e) => {
+      e.preventDefault();
+      endHold();
+    });
+  });
+
+  // ----- Edge taps (prev/next) -----
+  function wireEdge(el, delta) {
+    el.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      el.classList.add('active');
+      send({ type: delta < 0 ? 'switch_prev' : 'switch_next' });
+    });
+    ['pointerup', 'pointercancel', 'pointerleave'].forEach((evt) => {
+      el.addEventListener(evt, () => el.classList.remove('active'));
+    });
+  }
+  wireEdge(edgeL, -1);
+  wireEdge(edgeR, +1);
+
+  // Prevent double-tap zoom & context menus
+  document.addEventListener('gesturestart', (e) => e.preventDefault());
+  document.addEventListener('contextmenu', (e) => e.preventDefault());
+
+  connect();
+})();
+</script>
+</body>
+</html>
