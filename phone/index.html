@@ -32,6 +32,9 @@
     -webkit-touch-callout: none;
     -webkit-user-select: none;
     user-select: none;
+    /* Prevent iOS double-tap-to-zoom and pinch-zoom on all elements,
+       while still allowing single-finger scroll where needed. */
+    touch-action: manipulation;
   }
 
   html, body {
@@ -44,6 +47,13 @@
     font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", Inter, system-ui, sans-serif;
     overflow: hidden;
     overscroll-behavior: none;
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+    touch-action: manipulation;
+  }
+
+  /* The hold-to-talk area absolutely must not scroll, zoom, or pan. */
+  .hold, .edge {
     touch-action: none;
   }
 
@@ -384,8 +394,10 @@
   wireEdge(edgeL, -1);
   wireEdge(edgeR, +1);
 
-  // Prevent double-tap zoom & context menus
+  // Prevent pinch zoom, double-tap zoom, context menus
   document.addEventListener('gesturestart', (e) => e.preventDefault());
+  document.addEventListener('gesturechange', (e) => e.preventDefault());
+  document.addEventListener('dblclick', (e) => e.preventDefault());
   document.addEventListener('contextmenu', (e) => e.preventDefault());
 
   connect();
