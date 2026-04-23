@@ -84,6 +84,7 @@ from .certs import ensure_cert
 from .cursor_windows import CursorWindow, focus_window, list_windows
 from .mouse_control import mouse_click, mouse_move_by, mouse_scroll
 from .key_control import (
+    press_cmd_l,
     press_cmd_z,
     press_enter,
     press_option_enter,
@@ -107,6 +108,21 @@ POLL_INTERVAL_S = 1.0
 # Set to True to always queue. If the agent is idle, Option+Enter just
 # submits normally, so this is the safe default for agent workflows.
 QUEUE_INSTEAD_OF_INTERRUPT = True
+
+
+# Auto-focus Cursor's chat input after every window-focus. Fires
+# Cmd+L on Mac / Ctrl+L on the PC peer. The phone's swipe ends up
+# on a ready-to-dictate text field instead of (often) the code
+# editor. Set ``HC_AUTO_FOCUS_CHAT=0`` in the env to disable.
+_AUTO_FOCUS_CHAT = os.environ.get("HC_AUTO_FOCUS_CHAT", "1").strip() != "0"
+# Delay between raising the window and firing the hotkey. macOS
+# propagates frontmost-app changes asynchronously; without this the
+# hotkey can race ahead to whatever was frontmost BEFORE Cursor.
+# Override with HC_AUTO_FOCUS_CHAT_DELAY_MS.
+_AUTO_FOCUS_CHAT_DELAY_S = (
+    max(0, int(os.environ.get("HC_AUTO_FOCUS_CHAT_DELAY_MS", "120").strip()))
+    / 1000.0
+)
 
 
 def _sort_key(w: CursorWindow) -> tuple[str, str]:
@@ -454,6 +470,14 @@ async def handle_preset(preset_id: str) -> None:
     if on_pc:
         await state.peer.focus_window(win["title"])  # type: ignore[union-attr]
         await asyncio.sleep(0.12)
+        # Chat-focus before typing so the preset goes into the chat
+        # input, not the code editor (which frequently has focus).
+        if _AUTO_FOCUS_CHAT:
+            try:
+                await state.peer.focus_chat_input()  # type: ignore[union-attr]
+                await asyncio.sleep(0.05)
+            except Exception as exc:
+                print(f"[preset] chat-focus failed: {exc}")
         await state.peer.type_string(preset.text)  # type: ignore[union-attr]
         await asyncio.sleep(0.05)
         if preset.submit == "queue":
@@ -464,6 +488,12 @@ async def handle_preset(preset_id: str) -> None:
         focus_window(win["title"])
         # Let the WM actually transfer focus before we start firing keys.
         await asyncio.sleep(0.12)
+        if _AUTO_FOCUS_CHAT:
+            try:
+                await asyncio.to_thread(press_cmd_l)
+                await asyncio.sleep(0.05)
+            except Exception as exc:
+                print(f"[preset] chat-focus failed: {exc}")
         # Typing is blocking (~4ms per char × message length). Run in a
         # worker thread so the event loop stays responsive and other
         # clients (or another preset tap) don't queue up behind it.
@@ -494,11 +524,39 @@ async def handle_preset(preset_id: str) -> None:
 
 
 async def _focus_selected(win: dict) -> None:
-    """Focus a window, routing to the correct host."""
+    """Focus a window, routing to the correct host, then fire
+    Cursor's "focus chat input" hotkey (Cmd+L / Ctrl+L) so the
+    phone's swipe lands on a ready-to-dictate text field.
+
+    Why the sleep between the two steps: ``focus_window`` raises the
+    Cursor window, but macOS / Windows propagate the frontmost-app
+    change asynchronously. Without a brief wait, the hotkey can
+    race ahead and go to whatever was frontmost BEFORE Cursor
+    (e.g. Safari, where Cmd+L opens the address bar — obviously
+    not what anyone wants). 120ms is enough on every machine I've
+    tested and still feels instant.
+
+    Disable by setting ``HC_AUTO_FOCUS_CHAT=0`` in the environment.
+    """
     if win["host"] == "pc" and state.peer and state.peer.state.healthy:
         await state.peer.focus_window(win["title"])
     else:
         focus_window(win["title"])
+
+    if not _AUTO_FOCUS_CHAT:
+        return
+
+    await asyncio.sleep(_AUTO_FOCUS_CHAT_DELAY_S)
+    try:
+        if win["host"] == "pc" and state.peer and state.peer.state.healthy:
+            await state.peer.focus_chat_input()
+        else:
+            await asyncio.to_thread(press_cmd_l)
+    except Exception as exc:
+        # Never let a stray focus-hotkey failure swallow the whole
+        # swipe — the window is already focused, which is most of
+        # what the user wanted.
+        print(f"[focus] chat-input hotkey failed: {exc}")
 
 
 async def handle_select(index: int) -> None:

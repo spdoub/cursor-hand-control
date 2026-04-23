@@ -17,6 +17,7 @@ from Quartz import (
 KEYCODE_RIGHT_OPTION = 61
 KEYCODE_RETURN = 36
 KEYCODE_Z = 6  # kVK_ANSI_Z
+KEYCODE_L = 37  # kVK_ANSI_L
 
 # Tiny gap between synthesized keystrokes when typing a string. Most apps
 # handle bursts fine, but Electron chat inputs (Cursor, VSCode) can drop
@@ -59,6 +60,18 @@ def press_cmd_z() -> None:
     """Simulate Cmd+Z to undo the last Wispr Flow insertion."""
     _post(KEYCODE_Z, True, flags=kCGEventFlagMaskCommand)
     _post(KEYCODE_Z, False, flags=kCGEventFlagMaskCommand)
+
+
+def press_cmd_l() -> None:
+    """Simulate Cmd+L — Cursor's "open AI chat / focus chat input"
+    shortcut on macOS.
+
+    Fired right after a window focus so the phone's swipe-to-new-card
+    gesture lands the user on a ready-to-dictate chat input, not on
+    whatever the window last had selected (often the code editor).
+    """
+    _post(KEYCODE_L, True, flags=kCGEventFlagMaskCommand)
+    _post(KEYCODE_L, False, flags=kCGEventFlagMaskCommand)
 
 
 def type_string(text: str) -> None:

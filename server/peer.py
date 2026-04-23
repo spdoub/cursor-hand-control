@@ -256,6 +256,11 @@ class Peer:
     async def press_enter(self) -> None:
         await self._reliable_post("/peer/press_enter", {})
 
+    async def focus_chat_input(self) -> None:
+        """Cursor's Ctrl+L on the PC side — fired after focus_window
+        so the phone's new-card swipe lands on a ready chat input."""
+        await self._reliable_post("/peer/focus_chat_input", {})
+
     async def _reliable_post(
         self,
         path: str,

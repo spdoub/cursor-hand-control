@@ -263,6 +263,17 @@ async def press_enter_ep(x_hc_token: Optional[str] = Header(default=None)):
     return {"ok": True}
 
 
+@app.post("/peer/focus_chat_input")
+async def focus_chat_input_ep(
+    x_hc_token: Optional[str] = Header(default=None),
+):
+    """Ctrl+L — fire Cursor's chat-focus shortcut after a window focus
+    so the phone's swipe lands on a ready-to-dictate chat input."""
+    _check_token(x_hc_token)
+    await asyncio.to_thread(ops.press_ctrl_l)
+    return {"ok": True}
+
+
 # --- Boot -------------------------------------------------------------------
 
 

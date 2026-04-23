@@ -155,6 +155,17 @@ def press_ctrl_z() -> None:
     _kb_ctrl.release(_kb.Key.ctrl)
 
 
+def press_ctrl_l() -> None:
+    """Windows equivalent of Cmd+L — Cursor's "open AI chat / focus
+    chat input" shortcut. Fired right after a window-focus so the
+    phone swipe lands on a ready-to-dictate chat input.
+    """
+    _kb_ctrl.press(_kb.Key.ctrl)
+    _kb_ctrl.press("l")
+    _kb_ctrl.release("l")
+    _kb_ctrl.release(_kb.Key.ctrl)
+
+
 def type_string(text: str) -> None:
     """Type ``text`` into the currently-focused UI element."""
     # pynput's .type() already paces characters sensibly; no extra
