@@ -852,6 +852,33 @@
   });
   requestWakeLock();
 
+  // ---------------- Haptic feedback ----------------
+  //
+  // Web Vibration API wrapper. Patterns are in milliseconds —
+  // either a single number (one pulse) or an [on, off, on, …] array.
+  // Support matrix:
+  //   • Android Chrome / Firefox / Samsung Internet → ✓ works.
+  //   • Desktop Chrome / Edge on touch hardware     → ✓ works.
+  //   • iOS Safari (incl. Add-to-Home-Screen PWAs)  → ✗ no-op,
+  //     because Apple has never exposed the Taptic Engine to web
+  //     apps. There is no known workaround that's both reliable
+  //     and App-Store-compliant without a native wrapper.
+  //
+  // We feature-detect and silently swallow errors so an iPhone
+  // just gets a slightly less tactile but otherwise identical
+  // experience rather than any crash.
+  const HAPTIC = {
+    TAP:    6,            // generic click / button press
+    SOFT:   10,           // small state change (mode switch, edge cross)
+    MEDIUM: 18,           // "thing is now live" — hold engaged
+    DONE:   [8, 40, 14],  // success — transcription ready / submitted
+    ERR:    [20, 60, 20], // preset failed / nothing happened
+  };
+  function haptic(pattern) {
+    if (!('vibrate' in navigator)) return;
+    try { navigator.vibrate(pattern); } catch {}
+  }
+
   // ---------------- WebSocket ----------------
   function connect() {
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -924,6 +951,10 @@
           const autoSubmitted = msg.auto_submitted === true;
           if (mode === 'waiting') {
             setMode(autoSubmitted ? 'sent' : 'ready');
+            // Transcription arrived — success pulse. Stronger if
+            // we auto-sent ("it's done, look at your Mac") than if
+            // we're waiting for a button tap ("your turn").
+            haptic(autoSubmitted ? HAPTIC.DONE : HAPTIC.SOFT);
           }
         }
       } catch {}
@@ -1234,11 +1265,16 @@
     if (windows.length === 0) return;
     setMode('holding');
     send({ type: 'hold_start' });
+    // "you're being heard now" — firmer pulse than a tap.
+    haptic(HAPTIC.MEDIUM);
   }
   function endHold() {
     if (mode !== 'holding') return;
     setMode('waiting');
     send({ type: 'hold_end' });
+    // "got your release" — matches the feel of MacBook Force Touch
+    // click-down/click-up being two distinct haptic events.
+    haptic(HAPTIC.SOFT);
   }
 
   // ---------------- Submit / Delete / Click buttons ----------------
@@ -1250,21 +1286,25 @@
     e.preventDefault();
     if (appMode === 'pad') {
       send({ type: 'mouse_click', button: 'right' });
+      haptic(HAPTIC.TAP);
       return;
     }
     if (mode !== 'ready') return;
     send({ type: 'submit' });
     setMode('idle');
+    haptic(HAPTIC.TAP);
   });
   btnDelete.addEventListener('pointerdown', (e) => {
     e.preventDefault();
     if (appMode === 'pad') {
       send({ type: 'mouse_click', button: 'left' });
+      haptic(HAPTIC.TAP);
       return;
     }
     if (mode !== 'ready') return;
     send({ type: 'delete' });
     setMode('idle');
+    haptic(HAPTIC.SOFT);
   });
 
   // ---------------- App mode (Deck / Pad) ----------------
@@ -1295,6 +1335,7 @@
 
     appMode = next;
     document.body.setAttribute('data-app-mode', appMode);
+    haptic(HAPTIC.SOFT);
 
     // Toggle the tab button states.
     modeTabsEl.querySelectorAll('.mode-tab').forEach((tab) => {
@@ -1322,34 +1363,82 @@
 
   // ---------------- Trackpad (pad mode) ----------------
   //
-  // Single-finger drag → mouse_move with scaled delta.
-  // Single-finger tap (no drag, short) → left click.
-  // Two-finger drag vertical → scroll (avg of both fingers' dy).
+  // Mac-trackpad-parity goals:
+  //   • Single-finger drag → cursor move, no jitter, Mac-style
+  //     non-linear acceleration (slow = precise, fast = traverses).
+  //   • One-finger tap → left click. Two-finger tap → right click.
+  //   • Two-finger drag → scroll (averaged across both pointers).
+  //   • Edge-cross to the PC when two machines are paired.
   //
-  // Sensitivity: hardware pixels → Mac pixels. Phones pack ~2.5–3x
-  // as many physical pixels per inch as a typical Mac display, so
-  // a 2.0x base multiplier roughly matches "my finger moves half a
-  // screen, the cursor moves half a screen".
-  const PAD_SENSITIVITY = 2.0;
-  const PAD_TAP_MAX_MS = 250;
-  const PAD_TAP_MAX_PX = 6;
-  const SCROLL_SENSITIVITY = 1.8;
+  // Why the previous version glitched: it sent one WebSocket
+  // message per pointermove event. iOS Safari fires those up to
+  // 120 Hz on a 120 Hz screen, each with a single-sample delta, so
+  // under any network load you'd get visible stutter and the cursor
+  // would "walk" instead of "glide". It also hard-cut sub-pixel
+  // movement with `Math.abs(sx) >= 0.5`, so very slow drags dropped
+  // silently — the "sticky finger" feeling.
+  //
+  // The rewrite:
+  //   1. Use getCoalescedEvents() so we see every intermediate
+  //      sample the OS captured between dispatched pointermoves.
+  //      iOS Safari coalesces; using this is free precision.
+  //   2. Accumulate deltas per pointer per frame in padFrameDeltas.
+  //   3. One requestAnimationFrame callback emits ONE mouse_move or
+  //      ONE mouse_scroll per frame. That's 60–120 messages/second
+  //      max regardless of how fast the user swipes — which is
+  //      roughly what macOS itself feeds its cursor.
+  //   4. Sub-pixel remainder (padRemainderX/Y) lets tiny 0.3-px
+  //      deltas accumulate until they flip a whole pixel, so slow
+  //      drags work smoothly instead of being rounded to zero.
+  //   5. Acceleration curve — gentle ease on slow moves, super-
+  //      linear for fast swipes. Matches the feel of the macOS
+  //      default "tracking speed = medium" curve closely enough
+  //      that muscle memory survives the handoff.
 
-  // Map of active pointers on the trackpad.
-  // key: pointerId → { startX, startY, startT, lastX, lastY, lastT, moved }
+  const PAD_BASE_SENSITIVITY   = 1.55; // slow-move linear scale
+  const PAD_ACCEL_THRESHOLD    = 0.8;  // px/ms below which we DO NOT accelerate
+  const PAD_ACCEL_EXPONENT     = 0.85; // curve shape; 1.0 = linear
+  const PAD_ACCEL_COEFF        = 9.0;  // how quickly accel ramps
+  const PAD_ACCEL_CAP          = 3.4;  // hard ceiling on the multiplier
+
+  // Tap timing: gesture-wide (first-down → last-up), so the budget
+  // needs to be a bit more forgiving than a single-finger press —
+  // two-finger taps have natural motor timing around 220–300 ms.
+  const PAD_TAP_MAX_MS         = 320;
+  const PAD_TAP_MAX_PX         = 8;    // per-pointer jitter tolerance
+
+  const SCROLL_SENSITIVITY     = 1.6;
+
+  // Active pointers:  pointerId → { startX, startY, startT,
+  //                                 lastX, lastY, lastT, moved }
   const padPointers = new Map();
 
-  // Which host currently owns the virtual cursor — drives the pill
-  // in the corner of the trackpad. We also briefly flash the pad's
-  // accent border on crossing to make the handoff feel physical.
+  // Per-pointer, per-frame pending delta. Cleared by the flush.
+  const padFrameDeltas = new Map();   // pointerId → { dx, dy }
+  let padRemainderX       = 0;        // sub-pixel carry on move
+  let padRemainderY       = 0;
+  let padScrollRemainderX = 0;        // sub-pixel carry on scroll
+  let padScrollRemainderY = 0;
+  let padFrameScheduled   = false;
+
+  // Gesture-wide state (spans multiple pointer lifetimes). Resets
+  // when padPointers.size transitions from non-zero back to zero.
+  // We need this to distinguish 1-finger-tap (left click) from
+  // 2-finger-tap (right click) even though pointerup fires for
+  // each finger separately.
+  let padGestureMaxFingers = 0;
+  let padGestureAnyMoved   = false;
+  let padGestureStartT     = 0;
+
+  // Cursor-host pill (MAC / PC). Brief accent flash on crossing,
+  // plus a soft haptic pulse so the handoff feels physical.
   function setCursorHost(host) {
     if (host !== 'mac' && host !== 'pc') return;
     if (padHostEl.dataset.host === host) return;
     padHostEl.dataset.host = host;
     padHostEl.textContent = host.toUpperCase();
-    // Brief border flash — reusing the .active class is enough to
-    // momentarily accent the boundary.
     trackpadEl.classList.add('active');
+    haptic(HAPTIC.SOFT);
     setTimeout(() => {
       if (padPointers.size === 0) trackpadEl.classList.remove('active');
     }, 260);
@@ -1357,37 +1446,134 @@
 
   function padUpdateTouchIndicator(x, y) {
     const rect = trackpadEl.getBoundingClientRect();
-    const localX = x - rect.left;
-    const localY = y - rect.top;
-    padTouchEl.style.setProperty('--touch-x', localX + 'px');
-    padTouchEl.style.setProperty('--touch-y', localY + 'px');
+    padTouchEl.style.setProperty('--touch-x', (x - rect.left) + 'px');
+    padTouchEl.style.setProperty('--touch-y', (y - rect.top)  + 'px');
   }
 
   function cancelPadGesture() {
     padPointers.clear();
+    padFrameDeltas.clear();
+    padGestureMaxFingers = 0;
+    padGestureAnyMoved   = false;
+    padRemainderX = padRemainderY = 0;
+    padScrollRemainderX = padScrollRemainderY = 0;
     padTouchEl.classList.remove('show');
     trackpadEl.classList.remove('active');
+  }
+
+  function schedulePadFrame() {
+    if (padFrameScheduled) return;
+    padFrameScheduled = true;
+    requestAnimationFrame(flushPadFrame);
+  }
+
+  function flushPadFrame() {
+    padFrameScheduled = false;
+    if (padFrameDeltas.size === 0) return;
+
+    // How many fingers moved this frame determines whether this
+    // is a move or a scroll. We trust padPointers (live) over
+    // padFrameDeltas (may include a pointer that just lifted).
+    const activeCount = padPointers.size;
+    const movingIds   = [...padFrameDeltas.keys()];
+
+    if (activeCount <= 1 && movingIds.length >= 1) {
+      // Single-finger drag → cursor move. If multiple pointerids
+      // somehow queued (e.g. a quick second finger tap during a
+      // drag), sum their deltas — it'll still look like the user's
+      // intent.
+      let dx = 0, dy = 0;
+      for (const id of movingIds) {
+        const d = padFrameDeltas.get(id);
+        dx += d.dx; dy += d.dy;
+      }
+      emitPadMove(dx, dy);
+    } else if (activeCount >= 2) {
+      // Two-finger scroll — average deltas across whichever pointers
+      // moved this frame. Summing would make scrolling 2× too fast
+      // since the fingers should be moving roughly together.
+      let dx = 0, dy = 0;
+      for (const id of movingIds) {
+        const d = padFrameDeltas.get(id);
+        dx += d.dx; dy += d.dy;
+      }
+      dx /= movingIds.length;
+      dy /= movingIds.length;
+      emitPadScroll(dx, dy);
+    }
+
+    padFrameDeltas.clear();
+  }
+
+  // Trackpad-style acceleration: magnitude-aware multiplier.
+  // Below PAD_ACCEL_THRESHOLD (≈ a slow pen-on-paper drag) we use
+  // a flat 1.0× so precision doesn't fight the user. Above it we
+  // ramp into a power curve, capped so flick-swipes don't teleport
+  // off the screen.
+  function padAccelFactor(magPxPerFrame) {
+    // magPxPerFrame is effectively the speed at ~60 Hz. Convert to
+    // px/ms so the threshold isn't tied to frame rate.
+    const speed = magPxPerFrame / (1000 / 60);
+    if (speed <= PAD_ACCEL_THRESHOLD) return 1.0;
+    const over  = speed - PAD_ACCEL_THRESHOLD;
+    const boost = Math.pow(over * PAD_ACCEL_COEFF, PAD_ACCEL_EXPONENT);
+    return Math.min(PAD_ACCEL_CAP, 1.0 + boost * 0.12);
+  }
+
+  function emitPadMove(rawDx, rawDy) {
+    const mag   = Math.hypot(rawDx, rawDy);
+    const accel = padAccelFactor(mag);
+    const sx = rawDx * PAD_BASE_SENSITIVITY * accel + padRemainderX;
+    const sy = rawDy * PAD_BASE_SENSITIVITY * accel + padRemainderY;
+    // Math.trunc (vs round) keeps the sign consistent for the
+    // remainder — important so slow drags don't jitter around 0.
+    const ix = Math.trunc(sx);
+    const iy = Math.trunc(sy);
+    padRemainderX = sx - ix;
+    padRemainderY = sy - iy;
+    if (ix !== 0 || iy !== 0) send({ type: 'mouse_move', dx: ix, dy: iy });
+  }
+
+  function emitPadScroll(rawDx, rawDy) {
+    const sx = rawDx * SCROLL_SENSITIVITY + padScrollRemainderX;
+    const sy = rawDy * SCROLL_SENSITIVITY + padScrollRemainderY;
+    const ix = Math.trunc(sx);
+    const iy = Math.trunc(sy);
+    padScrollRemainderX = sx - ix;
+    padScrollRemainderY = sy - iy;
+    // macOS natural scroll convention: fingers down → content down.
+    if (ix !== 0 || iy !== 0) send({ type: 'mouse_scroll', dx: ix, dy: iy });
   }
 
   trackpadEl.addEventListener('pointerdown', (e) => {
     e.preventDefault();
     try { trackpadEl.setPointerCapture(e.pointerId); } catch {}
+
+    const now = performance.now();
+    if (padPointers.size === 0) {
+      // Fresh gesture — reset all gesture-wide accumulators. Keeping
+      // the per-gesture remainders fresh avoids "phantom drift" on
+      // the first few pixels of a new drag.
+      padGestureMaxFingers = 1;
+      padGestureAnyMoved   = false;
+      padGestureStartT     = now;
+      padRemainderX = padRemainderY = 0;
+      padScrollRemainderX = padScrollRemainderY = 0;
+    } else {
+      padGestureMaxFingers = Math.max(padGestureMaxFingers, padPointers.size + 1);
+    }
+
     padPointers.set(e.pointerId, {
-      startX: e.clientX,
-      startY: e.clientY,
-      startT: performance.now(),
-      lastX: e.clientX,
-      lastY: e.clientY,
-      lastT: performance.now(),
-      moved: false,
+      startX: e.clientX, startY: e.clientY, startT: now,
+      lastX:  e.clientX, lastY:  e.clientY, lastT:  now,
+      moved:  false,
     });
+
     if (padPointers.size === 1) {
       padUpdateTouchIndicator(e.clientX, e.clientY);
       padTouchEl.classList.add('show');
       trackpadEl.classList.add('active');
     } else {
-      // Multi-touch: hide the single-finger indicator so it doesn't
-      // lag behind whichever pointer disappears first.
       padTouchEl.classList.remove('show');
     }
   });
@@ -1396,40 +1582,43 @@
     const p = padPointers.get(e.pointerId);
     if (!p) return;
 
-    const dx = e.clientX - p.lastX;
-    const dy = e.clientY - p.lastY;
-    p.lastX = e.clientX;
-    p.lastY = e.clientY;
+    // iOS Safari coalesces pointer events on high-refresh screens;
+    // asking for the coalesced list gives us the intermediate
+    // samples the OS saw. Falling back to [e] for browsers that
+    // don't implement it (most desktops) is equivalent to the old
+    // behavior.
+    const coalesced =
+      (typeof e.getCoalescedEvents === 'function')
+        ? e.getCoalescedEvents()
+        : [];
+    const samples = coalesced.length ? coalesced : [e];
+
+    let dxTotal = 0, dyTotal = 0;
+    for (const s of samples) {
+      dxTotal += s.clientX - p.lastX;
+      dyTotal += s.clientY - p.lastY;
+      p.lastX  = s.clientX;
+      p.lastY  = s.clientY;
+    }
     p.lastT = performance.now();
 
+    // Per-pointer and gesture-wide "did they actually drag?" checks.
     const totalDx = e.clientX - p.startX;
     const totalDy = e.clientY - p.startY;
-    if (Math.abs(totalDx) > PAD_TAP_MAX_PX || Math.abs(totalDy) > PAD_TAP_MAX_PX) {
+    if (Math.abs(totalDx) > PAD_TAP_MAX_PX ||
+        Math.abs(totalDy) > PAD_TAP_MAX_PX) {
       p.moved = true;
+      padGestureAnyMoved = true;
     }
 
+    let acc = padFrameDeltas.get(e.pointerId);
+    if (!acc) { acc = { dx: 0, dy: 0 }; padFrameDeltas.set(e.pointerId, acc); }
+    acc.dx += dxTotal;
+    acc.dy += dyTotal;
+    schedulePadFrame();
+
     if (padPointers.size === 1) {
-      // Cursor move — scale by sensitivity, round to avoid sending
-      // zero-deltas (which the server would just discard anyway).
-      const sx = dx * PAD_SENSITIVITY;
-      const sy = dy * PAD_SENSITIVITY;
-      if (Math.abs(sx) >= 0.5 || Math.abs(sy) >= 0.5) {
-        send({ type: 'mouse_move', dx: sx, dy: sy });
-      }
       padUpdateTouchIndicator(e.clientX, e.clientY);
-    } else if (padPointers.size === 2) {
-      // Two-finger scroll — average the two pointers' vertical delta
-      // since the second pointer's delta isn't in `dx/dy` above. We
-      // just use THIS pointer's delta scaled down a bit; both pointers
-      // should move roughly together, so sending on each is fine.
-      const sy = dy * SCROLL_SENSITIVITY;
-      const sx = dx * SCROLL_SENSITIVITY;
-      if (Math.abs(sy) >= 1 || Math.abs(sx) >= 1) {
-        // macOS natural scroll convention: dragging fingers DOWN
-        // scrolls content DOWN (because the content sticks to your
-        // fingers). CGEventCreateScrollWheelEvent's sign matches.
-        send({ type: 'mouse_scroll', dx: sx, dy: sy });
-      }
     }
   });
 
@@ -1438,25 +1627,33 @@
     if (!p) return;
     padPointers.delete(e.pointerId);
 
-    const dur = performance.now() - p.startT;
-    const wasTap =
-      !p.moved &&
-      dur < PAD_TAP_MAX_MS &&
-      padPointers.size === 0; // only fire if the last pointer is gone
-
-    // A quick single-finger tap → left click. A quick two-finger tap
-    // (detected when the LAST of two quick taps lifts) → right click.
-    // We use `p.moved` + the count just after removal to decide.
-    if (wasTap) {
-      // Look at what OTHER fingers had been down during this tap's
-      // lifetime by checking if we just transitioned from 2 → 0. But
-      // since we delete one at a time, this is approximate. Good
-      // enough for v1: one finger → left click. Two fingers → user
-      // can use the explicit R-Click button.
-      send({ type: 'mouse_click', button: 'left' });
+    // Flush any pending frame synchronously so the last few pixels
+    // of a flick-drag don't get swallowed when the finger leaves.
+    if (padFrameScheduled || padFrameDeltas.size) {
+      flushPadFrame();
     }
 
+    // When the LAST pointer lifts, the gesture is complete —
+    // that's the moment we can classify it as a tap vs a drag and
+    // fire the click if appropriate.
     if (padPointers.size === 0) {
+      const gestureDur = performance.now() - padGestureStartT;
+      const wasTap     = !padGestureAnyMoved &&
+                         gestureDur < PAD_TAP_MAX_MS;
+
+      if (wasTap) {
+        if (padGestureMaxFingers >= 2) {
+          send({ type: 'mouse_click', button: 'right' });
+        } else {
+          send({ type: 'mouse_click', button: 'left' });
+        }
+        haptic(HAPTIC.TAP);
+      }
+
+      // Reset gesture state for the next gesture.
+      padGestureMaxFingers = 0;
+      padGestureAnyMoved   = false;
+      padFrameDeltas.clear();
       padTouchEl.classList.remove('show');
       trackpadEl.classList.remove('active');
     }
@@ -1484,6 +1681,7 @@
         e.preventDefault();
         e.stopPropagation();
         firePreset(p);
+        haptic(HAPTIC.TAP);
       });
       presetsEl.appendChild(el);
     });
@@ -1509,6 +1707,10 @@
     if (!el) return;
     el.classList.remove('firing');
     el.classList.add(ok ? 'flash-ok' : 'flash-err');
+    // Confirm server actually fired it. ERR pattern tells the user
+    // to look at their Mac — the preset either had no text field to
+    // paste into, or Cursor wasn't focusable.
+    haptic(ok ? HAPTIC.DONE : HAPTIC.ERR);
     setTimeout(() => {
       el.classList.remove('flash-ok', 'flash-err');
     }, 900);
@@ -1559,6 +1761,7 @@
   function engageJoystick() {
     joyOn = true;
     updateJoyChip();
+    haptic(HAPTIC.MEDIUM);
   }
 
   function disengageJoystick() {
@@ -1568,6 +1771,7 @@
     joyRAF = 0;
     hideJoyVisuals();
     updateJoyChip();
+    haptic(HAPTIC.SOFT);
   }
 
   joyChipEl.addEventListener('pointerdown', (e) => {
@@ -1654,7 +1858,10 @@
     cancelAnimationFrame(joyRAF);
     joyRAF = 0;
     hideJoyVisuals();
-    if (wasTap) send({ type: 'mouse_click', button: 'left' });
+    if (wasTap) {
+      send({ type: 'mouse_click', button: 'left' });
+      haptic(HAPTIC.TAP);
+    }
   }
 
   // ----- RAF loop: translate stick offset → per-frame mouse_move -----
