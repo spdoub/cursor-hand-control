@@ -159,12 +159,50 @@ else
   warn "couldn't pre-generate cert — no big deal, it'll be made on first launch."
 fi
 
-# --- 5. App bundle ---------------------------------------------------------
+# --- 5. App bundle + one-click launch shortcuts ---------------------------
 
-step "5/6  Hand Control.app"
+step "5/6  Hand Control.app  +  launch shortcuts"
 
 chmod +x scripts/build-app.sh
 ./scripts/build-app.sh
+
+APP_PATH="$HOME/Applications/Hand Control.app"
+
+# 5a. Desktop alias so double-clicking from the desktop just works.
+if [ -d "$APP_PATH" ]; then
+  osascript >/dev/null 2>&1 <<OSA || true
+tell application "Finder"
+    if exists (alias file "Hand Control" of desktop) then
+        delete (alias file "Hand Control" of desktop)
+    end if
+    make new alias file at desktop to (POSIX file "$APP_PATH")
+    set name of result to "Hand Control"
+end tell
+OSA
+  if [ -e "$HOME/Desktop/Hand Control" ]; then
+    ok "Desktop shortcut: ~/Desktop/Hand Control"
+  fi
+
+  # 5b. Pin to the Dock (no-op if already there).
+  #
+  # defaults serializes the app path URL-encoded ("Hand%20Control.app")
+  # and the bundle-identifier uncoded ("com.handcontrol.launcher"), so
+  # we match on the bundle ID — the one thing that's both unique and
+  # immune to path formatting quirks.
+  if defaults read com.apple.dock persistent-apps 2>/dev/null \
+       | grep -q 'com.handcontrol.launcher'; then
+    ok "Dock:  already pinned"
+  else
+    ENCODED_PATH="${APP_PATH// /%20}"
+    DOCK_ENTRY="<dict><key>tile-data</key><dict><key>file-data</key><dict><key>_CFURLString</key><string>file://${ENCODED_PATH}/</string><key>_CFURLStringType</key><integer>15</integer></dict></dict></dict>"
+    if defaults write com.apple.dock persistent-apps -array-add "$DOCK_ENTRY" 2>/dev/null; then
+      killall Dock 2>/dev/null || true
+      ok "Dock:  pinned Hand Control"
+    else
+      warn "couldn't add to Dock automatically (not fatal — drag the icon from ~/Applications)."
+    fi
+  fi
+fi
 
 # --- 6. Final setup: Wispr Flow + macOS permissions ------------------------
 
@@ -216,8 +254,9 @@ Y="$(printf '\033[33m')"      # yellow
 
 printf '%s\n' "\
   1.  ${B}Launch Hand Control${R}
-      Cmd+Space → type \"Hand Control\" → Return.
-      (Or find it in Launchpad.)
+      Click the Hand Control icon in your Dock,
+      or double-click the 'Hand Control' shortcut on your Desktop.
+      (Cmd+Space → \"Hand Control\" → Return also works.)
       A Terminal window opens with a scannable QR code.
 
   2.  ${B}Point your phone's camera at the QR code${R}
